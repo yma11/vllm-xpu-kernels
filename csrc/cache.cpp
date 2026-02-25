@@ -7,6 +7,7 @@
 #include "dispatch_utils.h"
 #include "quantization/fp8/quant_utils.h"
 #include "utils.h"
+#include "utils/memory.h"
 
 namespace vllm {
 
@@ -634,5 +635,213 @@ void gather_cache(
     CALL_GATHER_CACHE(uint8_t);
   } else {
     TORCH_CHECK(false, "Unsupported data type width: ", dtype_bits);
+  }
+}
+
+void swap_blocks(
+    at::Tensor& src,
+    at::Tensor& dst,
+    int64_t block_size_in_bytes,
+    const torch::Tensor& block_map  // [num_pairs, 2]
+) {
+  at::Device src_device = src.device();
+  at::Device dst_device = dst.device();
+
+  const at::OptionalDeviceGuard device_guard(
+      src_device.is_xpu()
+          ? src_device
+          : (dst_device.is_xpu() ? dst_device : at::Device(at::kCPU)));
+
+  vllm::xpu::xpuMemcpyKind cpy_kind;
+  if (src_device.is_xpu() && dst_device.is_xpu()) {
+    TORCH_CHECK(
+        src_device.index() == dst_device.index(),
+        "src and dst must be on the same XPU");
+    cpy_kind = vllm::xpu::xpuMemcpyKind::DeviceToDevice;
+  } else if (src_device.is_xpu() && dst_device.is_cpu()) {
+    cpy_kind = vllm::xpu::xpuMemcpyKind::DeviceToHost;
+  } else if (src_device.is_cpu() && dst_device.is_xpu()) {
+    cpy_kind = vllm::xpu::xpuMemcpyKind::HostToDevice;
+  } else {
+    TORCH_CHECK(false, "Invalid device combination");
+  }
+
+  TORCH_CHECK(block_map.device().is_cpu(), "block_map must be on CPU");
+
+  char* src_ptr = static_cast<char*>(src.data_ptr());
+  char* dst_ptr = static_cast<char*>(dst.data_ptr());
+
+  const int64_t* block_map_data = block_map.data_ptr<int64_t>();
+  const int64_t num_blocks = block_map.size(0);
+
+  // Identify the host tensor based on copy direction and extract hctx
+  const at::Tensor* host_tensor = nullptr;
+  if (cpy_kind == vllm::xpu::xpuMemcpyKind::HostToDevice) {
+    host_tensor = &src;  // Host is source
+  } else if (cpy_kind == vllm::xpu::xpuMemcpyKind::DeviceToHost) {
+    host_tensor = &dst;  // Host is destination
+  }
+
+  bool is_pinned = false;
+  const void* hctx = nullptr;
+  if (host_tensor != nullptr) {
+    is_pinned = host_tensor->is_pinned();
+    if (is_pinned) {
+      // Extract hctx from the tensor's storage DataPtr context
+      hctx = host_tensor->storage().data_ptr().get_context();
+    }
+  }
+
+  for (int64_t i = 0; i < num_blocks; i++) {
+    int64_t src_block_number = block_map_data[i * 2];
+    int64_t dst_block_number = block_map_data[i * 2 + 1];
+
+    int64_t src_offset = src_block_number * block_size_in_bytes;
+    int64_t dst_offset = dst_block_number * block_size_in_bytes;
+
+    vllm::xpu::xpuAsyncMemcpy(
+        dst_ptr + dst_offset,
+        src_ptr + src_offset,
+        block_size_in_bytes,
+        cpy_kind,
+        hctx,
+        is_pinned);
+  }
+
+  return;
+}
+
+namespace vllm {
+
+// Kernel for FP8 conversion
+// Converts between FP8 and FP16/BF16/FP32 formats with scaling
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+class convert_fp8_kernel {
+ public:
+  convert_fp8_kernel(
+      cache_t* __restrict__ dst,
+      const scalar_t* __restrict__ src,
+      const float scale,
+      const int64_t numel)
+      : dst_(dst), src_(src), scale_(scale), numel_(numel) {}
+
+  void operator()(const sycl::nd_item<1>& item) const {
+    const int64_t idx = item.get_global_id(0);
+    if (idx >= numel_) return;
+
+    if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+      // Dequantize: FP8 -> FP16/BF16/FP32
+      // In this case, cache_t is the output type (FP16/BF16/FP32)
+      // and scalar_t is the input type (FP8)
+      dst_[idx] = static_cast<cache_t>(static_cast<float>(src_[idx]) * scale_);
+    } else if constexpr (kv_dt == Fp8KVCacheDataType::kFp8E4M3) {
+      // Quantize: FP16/BF16/FP32 -> FP8 E4M3
+      float val = static_cast<float>(src_[idx]) / scale_;
+      dst_[idx] = static_cast<at::Float8_e4m3fn>(val);
+    } else if constexpr (kv_dt == Fp8KVCacheDataType::kFp8E5M2) {
+      // Quantize: FP16/BF16/FP32 -> FP8 E5M2
+      float val = static_cast<float>(src_[idx]) / scale_;
+      dst_[idx] = static_cast<at::Float8_e5m2>(val);
+    }
+  }
+
+ private:
+  cache_t* __restrict__ dst_;
+  const scalar_t* __restrict__ src_;
+  const float scale_;
+  const int64_t numel_;
+};
+
+}  // namespace vllm
+
+#define CALL_CONVERT_FP8_KERNEL(SCALAR_T, CACHE_T, KV_DTYPE)   \
+  queue.submit([&](sycl::handler& cgh) {                       \
+    cgh.parallel_for(                                          \
+        sycl::nd_range<1>(grid * block, block),                \
+        vllm::convert_fp8_kernel<SCALAR_T, CACHE_T, KV_DTYPE>( \
+            reinterpret_cast<CACHE_T*>(dst.data_ptr()),        \
+            reinterpret_cast<const SCALAR_T*>(src.data_ptr()), \
+            scale,                                             \
+            numel));                                           \
+  });
+
+// Only for testing.
+void convert_fp8(
+    torch::Tensor& dst,
+    const torch::Tensor& src,
+    const double scale,
+    const std::string& kv_cache_dtype) {
+  torch::Device src_device = src.device();
+  torch::Device dst_device = dst.device();
+  TORCH_CHECK(src_device.is_xpu(), "src must be on a XPU");
+  TORCH_CHECK(dst_device.is_xpu(), "dst must be on a XPU");
+  TORCH_CHECK(
+      src_device.index() == dst_device.index(),
+      "src and dst must be on the same XPU");
+
+  const int64_t numel = src.numel();
+  const int threads = 256;
+  const int64_t num_blocks = (numel + threads - 1) / threads;
+
+  const at::DeviceGuard device_guard(src.device());
+  auto& queue = vllm::xpu::vllmGetQueue();
+
+  sycl::range<1> grid(num_blocks);
+  sycl::range<1> block(threads);
+
+  // Dispatch based on conversion direction
+  // If kv_cache_dtype is "auto", we're dequantizing (FP8 -> FP16/BF16/FP32)
+  // Otherwise, we're quantizing (FP16/BF16/FP32 -> FP8)
+  if (kv_cache_dtype == "auto") {
+    // Dequantization: src is FP8, dst is FP16/BF16/FP32
+    if (dst.scalar_type() == at::ScalarType::Float) {
+      if (src.scalar_type() == at::ScalarType::Float8_e4m3fn) {
+        CALL_CONVERT_FP8_KERNEL(
+            at::Float8_e4m3fn, float, vllm::Fp8KVCacheDataType::kAuto);
+      } else if (src.scalar_type() == at::ScalarType::Float8_e5m2) {
+        CALL_CONVERT_FP8_KERNEL(
+            at::Float8_e5m2, float, vllm::Fp8KVCacheDataType::kAuto);
+      } else {
+        TORCH_CHECK(
+            false,
+            "Unsupported src type for dequantization: ",
+            src.scalar_type());
+      }
+    } else if (dst.scalar_type() == at::ScalarType::Half) {
+      if (src.scalar_type() == at::ScalarType::Float8_e4m3fn) {
+        CALL_CONVERT_FP8_KERNEL(
+            at::Float8_e4m3fn, at::Half, vllm::Fp8KVCacheDataType::kAuto);
+      } else if (src.scalar_type() == at::ScalarType::Float8_e5m2) {
+        CALL_CONVERT_FP8_KERNEL(
+            at::Float8_e5m2, at::Half, vllm::Fp8KVCacheDataType::kAuto);
+      } else {
+        TORCH_CHECK(
+            false,
+            "Unsupported src type for dequantization: ",
+            src.scalar_type());
+      }
+    } else if (dst.scalar_type() == at::ScalarType::BFloat16) {
+      if (src.scalar_type() == at::ScalarType::Float8_e4m3fn) {
+        CALL_CONVERT_FP8_KERNEL(
+            at::Float8_e4m3fn, at::BFloat16, vllm::Fp8KVCacheDataType::kAuto);
+      } else if (src.scalar_type() == at::ScalarType::Float8_e5m2) {
+        CALL_CONVERT_FP8_KERNEL(
+            at::Float8_e5m2, at::BFloat16, vllm::Fp8KVCacheDataType::kAuto);
+      } else {
+        TORCH_CHECK(
+            false,
+            "Unsupported src type for dequantization: ",
+            src.scalar_type());
+      }
+    } else {
+      TORCH_CHECK(
+          false,
+          "Unsupported dst type for dequantization: ",
+          dst.scalar_type());
+    }
+  } else {
+    // Quantization: src is FP16/BF16/FP32, dst is FP8
+    DISPATCH_BY_KV_CACHE_DTYPE(
+        src.scalar_type(), kv_cache_dtype, CALL_CONVERT_FP8_KERNEL);
   }
 }
