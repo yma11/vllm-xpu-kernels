@@ -110,6 +110,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "get_xpu_view_from_cpu_tensor",
       torch::kCPU,
       &get_xpu_view_from_cpu_tensor);
+
+  // Synchronous raw-pointer memcpy helper (0=H2D, 1=D2H, 2=D2D).
+  // This is intentionally pointer-based to support allocator-managed buffers.
+  ops.def(
+      "xpu_memcpy_sync(int dst_ptr, int src_ptr, int n_bytes, int kind, "
+      "int device=-1) -> ()");
+  ops.impl("xpu_memcpy_sync", &xpu_memcpy_sync);
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {

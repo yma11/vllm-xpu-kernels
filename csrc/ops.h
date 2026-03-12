@@ -119,3 +119,10 @@ void swap_blocks(
     torch::Tensor& dst,
     int64_t block_size_in_bytes,
     const torch::Tensor& block_mapping);
+
+void xpu_memcpy_sync(
+    int64_t dst_ptr,
+    int64_t src_ptr,
+    int64_t n_bytes,
+    int64_t kind,
+    int64_t device = -1);
