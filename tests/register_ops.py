@@ -7,6 +7,10 @@ import vllm_xpu_kernels._C  # noqa: F401
 import vllm_xpu_kernels._moe_C  # noqa: F401
 import vllm_xpu_kernels._xpu_C  # noqa: F401
 
+MEMCPY_HOST_TO_DEVICE = 0
+MEMCPY_DEVICE_TO_HOST = 1
+MEMCPY_DEVICE_TO_DEVICE = 2
+
 
 # layer norm ops
 def rms_norm(out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
@@ -141,6 +145,27 @@ def gather_cache(src_cache: torch.Tensor,
                  seq_starts: Optional[torch.Tensor] = None) -> None:
     torch.ops._C_cache_ops.gather_cache(src_cache, dst, block_table,
                                         cu_seq_lens, batch_size, seq_starts)
+
+
+def xpu_memcpy_sync(dst_ptr: int,
+                    src_ptr: int,
+                    n_bytes: int,
+                    kind: int,
+                    device: int = -1) -> None:
+    """Pointer-based synchronous memcpy op.
+
+    kind: 0=H2D, 1=D2H, 2=D2D.
+    """
+    def _to_i64_ptr(ptr: int) -> int:
+        return ptr if ptr < (1 << 63) else ptr - (1 << 64)
+
+    torch.ops._C.xpu_memcpy_sync(
+        _to_i64_ptr(dst_ptr),
+        _to_i64_ptr(src_ptr),
+        n_bytes,
+        kind,
+        device,
+    )
 
 
 def convert_fp8(
